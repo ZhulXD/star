@@ -1,40 +1,91 @@
-name: Build LSFG native library
+name: win 11 + tailscale + RDP timer
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-lsfg:
-    runs-on: ubuntu-22.04
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      RDP_PASSWORD: "MR.English2008"
+      SCRIPTS_URL: "https://gitlab.com/Deriz/pcrdp_me/-/tree/main"
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install NDK
+      - name: Configure RDP and create user
         run: |
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          mkdir -p "$SDK_ROOT"
-          if [ ! -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            curl -sL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
-            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools/
-            mkdir -p "$SDK_ROOT/cmdline-tools"
-            mv /tmp/cmdline-tools/cmdline-tools "$SDK_ROOT/cmdline-tools/latest" 2>/dev/null || true
-            rm -f /tmp/cmdline-tools.zip
-          fi
-          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.1.10909125" "cmake;3.22.1"
-          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
+          (Get-Date).ToUniversalTime().AddMinutes(348).ToString("o") | Set-Content -Path "C:\Users\Public\rdp_end.txt" -Encoding ascii
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+          $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $ts -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Grant execute permission for build script
-        run: chmod +x build-lsfg-android.sh
-      - name: Build LSFG native library
-        run: ./build-lsfg-android.sh
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          Restart-Service -Name TermService -Force
 
-      - name: Upload LSFG .so
-        uses: actions/upload-artifact@v4
-        with:
-          name: lsfg-native
-          path: app/src/main/jniLibs/arm64-v8a/libVkLayer_LSFGVK_frame_generation.so
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          foreach ($g in "Administrators", "Remote Desktop Users", "Users") {
+              Add-LocalGroupMember -Group $g -Member "RDP"
+          }
+          net accounts /lockoutthreshold:0
+          net user RDP /active:yes
+
+      - name: Connect Tailscale
+        env:
+          TS_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+
+          $tok = Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/oauth/token" `
+            -Body @{ client_id = $env:TS_CLIENT_ID; client_secret = $env:TS_CLIENT_SECRET; grant_type = "client_credentials" }
+
+          $body = @{
+            expirySeconds = 600
+            capabilities  = @{ devices = @{ create = @{
+              reusable = $false; ephemeral = $true; preauthorized = $true; tags = @("tag:ci")
+            } } }
+          } | ConvertTo-Json -Depth 6
+
+          $key = Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/tailnet/-/keys" `
+            -Headers @{ Authorization = "Bearer $($tok.access_token)" } -ContentType "application/json" -Body $body
+          if (-not $key.key) { Write-Error "Failed to create Tailscale auth key." }
+          Write-Host "::add-mask::$($key.key)"
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up "--authkey=$($key.key)" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+          $ip = $null
+          for ($i = 0; $i -lt 10 -and -not $ip; $i++) {
+              $ip = & $ts ip -4
+              if (-not $ip) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ip) { Write-Error "Tailscale IP not assigned." }
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          if (-not (Test-NetConnection -ComputerName $ip -Port 3389).TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is not reachable"
+          }
+
+      - name: Download and run Downloads.bat
+        continue-on-error: true
+        run: |
+          curl.exe -s -L -f -o Downloads.bat ($env:SCRIPTS_URL + "Downloads.bat")
+          cmd /c Downloads.bat
+
+      - name: Keep Runner Alive
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+          while ($true) { Start-Sleep -Seconds 300 }
