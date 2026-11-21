@@ -1,4 +1,4 @@
-name: win 11 + tailscale + RDP timer
+name: tailscale
 
 on:
   workflow_dispatch:
