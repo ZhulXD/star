@@ -1,4 +1,4 @@
-name: tailscale
+name: BUILD LSFG BINARY
 
 on:
   workflow_dispatch:
