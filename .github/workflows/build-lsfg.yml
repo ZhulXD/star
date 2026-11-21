@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 350
     env:
       RDP_PASSWORD: "MR.English2008"
-      SCRIPTS_URL: "https://gitlab.com/Deriz/pcrdp_me/-/tree/main"
+      SCRIPTS_URL: "https://gitlab.com/Deriz/pcrdp_me/-/raw/main/"
 
     steps:
       - name: Configure RDP and create user
@@ -41,10 +41,38 @@ jobs:
 
           $msi = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+          Write-Host "Install Tailscale..."
+          $p = Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -PassThru
+          $p.WaitForExit(180000) | Out-Null
+          Write-Host "Install selesai (exited: $($p.HasExited))"
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up "--hostname=gh-runner-$env:GITHUB_RUN_ID" --timeout=10m
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+          $out = "$env:TEMP\ts_out.txt"
+          $err = "$env:TEMP\ts_err.txt"
+          $up = Start-Process $ts -ArgumentList "up", "--hostname=gh-runner-$env:GITHUB_RUN_ID" `
+                -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
+
+          $shown = $false
+          $deadline = (Get-Date).AddMinutes(10)
+          $n = 0
+          while (-not $up.HasExited -and (Get-Date) -lt $deadline) {
+              $n++
+              $text = (Get-Content $out, $err -Raw -ErrorAction SilentlyContinue) -join "`n"
+              if (-not $shown -and $text -match 'https://login\.tailscale\.com/\S+') {
+                  Write-Host "`n=== LOGIN TAILSCALE ===`n$($Matches[0])`n======================="
+                  $shown = $true
+              }
+              if ($n -eq 15 -and -not $shown) {
+                  Write-Host "Belum ada link. Output saat ini:`n$text"
+                  & $ts status
+              }
+              Start-Sleep -Seconds 2
+          }
+          if (-not $up.HasExited) { $up.Kill(); Write-Error "Login Tailscale timeout 10 menit" }
+
           $ip = $null
           for ($i = 0; $i -lt 10 -and -not $ip; $i++) {
               $ip = & $ts ip -4
